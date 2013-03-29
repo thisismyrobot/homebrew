@@ -1,0 +1,44 @@
+Aims
+----
+
+Fairly simple, beer brewing.
+
+All gear low voltage (12 or less) across the board, and low amperage.
+
+Aiming to make lagers and ales, so need flexible temperature control.
+
+Tiny (4L/1 Gallon) batches :)
+
+Hardware
+--------
+
+ * Basic home-brew kit
+    * Airlock seal
+    * Bucket design
+ * Water filter for incoming water
+    * Mounted on bucket
+ * Silver insulated foil wrapped around bucket
+ * Inlet and outlet pipes
+ * Mains to 12V ciggaret socket
+    * http://www.jaycar.com.au/productView.asp?ID=MP3575
+ * Heater/cooler (running as cooler)
+    * http://dicksmith.com.au/product/M4501/7litre-travel-cooler-and-warmer
+ * Use a thermowell + 1-wire sensor to get temperature
+    * http://www.ebay.com.au/itm/Solid-Stainless-Steel-100mm-Weldless-Thermowell-Home-Brew-/271163220061
+    * http://www.ebay.com.au/itm/THERMOWELL-304ss-1-2-FPT-x-6-L-x-1-2-MTP-PROTECTION-TUBE-BREWING-282ER21-/190816946488
+
+Info
+----
+
+ * Ales (Coopers) best at 21°C
+ * Largers are good at 5-15°C
+ * Cooler temperatures tend to create better beers
+ * Fermentation generates heat
+
+Cool ideas
+----------
+
+ * Insulate bucket so that fermetation heat can keep it warm. Then can leave
+   outside maybe, or at least not need to heat it.
+ * Use as a small 12v fan (or two) to move room temp air inside if too hot.
+ * Tiny 4-5L glass jug.
