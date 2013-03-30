@@ -1,38 +1,118 @@
 #!/usr/bin/env python
 
 """
+A Python driver for the CM19a X10 RF Transceiver (USB)
+This is a user space driver so a kernel driver for the CM19a does not need to be installed.
 
-    A Python driver for the CM19a X10 RF Transceiver (USB)
-    This is a user space driver so a kernel driver for the CM19a does not need
-    to be installed.
+Functionality
+ - Use a CM19a to send any X10 on/off command (eg A1 OFF, C16 DIM) wirelessly to a lamp or appliance module (requires an X10 receiver module).
+ - Use a CM19a to automatically receive and log to a queue any command received from an X10 RF remote control.
 
-    Initially coded by: Andrew Cuddon (www.cuddon.net)
+Coded by: Andrew Cuddon (www.cuddon.net)
 
-    Heavily revised for web-server-only mode by Robert Wallhead
-    (thisismyrobot.com)
+Version 3.0
+September 2011
+
+Changelog 0.20 - 3.0
+- Added basic command line argument functionality
+    * e.g. cm19a_X10_USB.py A1 ON
+    * Send only, you cannot receive commands via this approach becuase the device does not maintain a queue of commands received.
+    * Relatively slow because the driver must initialise the device each time and then exit.
+    * This is the default mode of operation: MODE = 'Command Line'
+- Added in-built HTTP server
+    * Send and receive commands via a web browser, any app that supports http, or even the command line (using cURL)
+    * e.g. http://192.168.1.3:8008/?house=A&unit=1&command=ON
+    * The driver starts and remains running so it can monitor and respond to http requests and capture inbound RF commands received by the CM19a
+    * Faster than the basic command line interface becuase the device needs to be initilaised only once (at startup)
+    * You need to set MODE = 'HTTP Server' to use the driver this way. You also need to set the IP address and port you wish to use.
+- Fixed several bugs relating to bright/dim functionality
+    * Added in missing bright/dim commands to the protocol file
+    * Modified approach to decode bright/dim button presses from a X10 RF remote
+    * Now identifies the house code as well as the button pressessed (bright or dim) on the RF keychain remote
+
+Changelog 0.11 - 0.20
+- Added Bright/Dim functionality
+- Added Python Logging
+- Bug fixes
+- When searching for a CM19a exits the search when it finds the first matching device
+- Added flag to control whether to start the receiving thread automatically (default is to start)
+- Some methods renamed so they are not exposed as an XML-RPC call (via a separate programme)
+
+Changelog 0.1 - 0.11
+- Add saving error messages to an object attribute so they can be utilised by a separate UI app
+- Fixed a couple of coding errors
+
+Requires:
+    pyUSB
+    libusb 0.1 series
+
+NOTES:
+- You need to disable any other driver that attempts to attach to this device:
+    On Ubuntu 11.04:
+        sudo nano  /etc/modprobe.d/blacklist.conf  (may just be blacklist (without the .conf) on other distros)
+        Add in the follow text and save
+            # To enable CM19a X10 Transceiver to work
+            blacklist lirc_atiusb
+            blacklist ati_remote
+        reboot
+
+- To claim control of the USB device you may find you need to run this as the root user
+- On Ubuntu you could use:
+    sudo python CM19a_X10_USB.py
+- But this is not very good practice
+
+It is better to set permissions via udev
+1. Create a udev permissions files so that when udev creates a device file when the transceiver is connected, the correct permissions are set
+    sudo nano /etc/udev/rules.d/cm19a.rules
+        Note that I did not number this file so it runs after all other permissions are set.
+2. Add in the following text and save
+    # Allow all users to read and write to the CM19a X10 Transceiver (USB)
+    SYSFS{idVendor}=="0bc7", SYSFS{idProduct}=="0002", MODE="666"
+3. If your CM19a is plugged in, then remove, wait a sec or two and then plug it back in again. The correct permissions should now be set.
+4. Any user should now be able to run the driver without using sudo.
+    eg. From a terminal: ./CM19aDriver.py
+
+TTDs
+    * Web graphical interface
+    * Identifying and detaching any pre-existing kernel driver
+    * Run as a daemon
+    * User Privileges
 
 """
 
-import BaseHTTPServer
-import httplib
-import os
-import SimpleHTTPServer
-import sys
-import threading
-import time
-import types
+# *************** CONFIGURATION ***************
+
+LOGFILE = './cm19a.log'             # Path and filename for the logfile
+
+MODE = 'Command Line'              # Mode of operation: either 'Command Line', 'HTTP Server'
+#MODE = 'HTTP Server'
+
+# Required only if MODE == 'HTTP Server'
+SERVER_IP_ADDRESS = '192.168.1.3'              # Set SERVERIP to the IP address of the server
+SERVER_PORT = 8008                             # Consider firewall rules if any
+
+# Required only for HTTP Server and importing into another script
+REFRESH = 1.0               # Refresh rate (seconds) for polling the transceiver for inbound commands
+
+
+# *************** CODE ***************
+VERSION = "3.00"
+
+# Standard modules
+import sys, time, os, threading, types
+import socket, BaseHTTPServer, httplib
+
+# pyUSB 1.0 (for libUSB 1.0 series)
 import usb
 
+# Code Modules
+import logger
 
-SERVER_IP_ADDRESS = 'localhost'
-SERVER_PORT = 80
-REFRESH = 1.0
-
-global cm19a, server
-
+# Globals
+global cm19a, log, server
 
 class USBdevice:
-    def __init__(self, vendor_id, product_id):
+    def __init__(self, vendor_id, product_id) :
         self.vendor_id = vendor_id
         self.product_id = product_id
         self.bus = None
@@ -40,22 +120,40 @@ class USBdevice:
         self._find_device()
 
     def _find_device(self):
+        # Search across all USB busses for the nominated device
+        # Finishes searching when the first matching device is found
         buses = usb.busses()
-        for bus in buses:
-            for device in bus.devices:
-                if (device.idVendor == self.vendor_id and
-                    device.idProduct == self.product_id):
+        for bus in buses :
+            for device in bus.devices :
+                if device.idVendor == self.vendor_id and device.idProduct == self.product_id:
                     self.bus = bus
                     self.device = device
                     break
+            #end for loop
             if self.device:
+                # A device was found so look no further
                 break
+        #end for loop
 
     def get_device(self):
         return self.device
 
+    def print_device_info(self):
+        "Prints out the device information"
+        if not self.device:
+            print "Device (%r, %r) not found" % (self.vendor_id, self.product_id)
+            return
+
+        print "  Vendor ID (dev.idVendor): %d (%04x hex)" % (self.device.idVendor, self.device.idVendor)
+        print "  Product ID (dev.idProduct): %d (%04x hex)" % (self.device.idProduct, self.device.idProduct)
+        print "  Device Version:",self.device.deviceVersion
+        print "  usbVersion: ",  self.device.usbVersion
+        print "  Number of Configurations: ",  len(self.device.configurations)
+#end of class
+
 
 class CM19aDevice(threading.Thread):
+    # subclasses the Thread class from the threading module
 
     # Class constants (run once only when the module is loaded)
     VENDOR_ID = 0x0bc7              # Vendor Id: X10 Wireless Technology, Inc.
@@ -63,16 +161,16 @@ class CM19aDevice(threading.Thread):
     CONFIGURATION_ID = 1            # Use configuration #1 (This device has only 1 configuration)
     INTERFACE_ID = 0                # The interface we use to talk to the device (This is the only configuration available for this device)
     ALTERNATE_SETTING_ID = 0        # The alternate setting to use on the selected interface
-    READ_EP_ADDRESS = 0x081         # Endpoint for reading from the device: 129 (decimal)
-    WRITE_EP_ADDRESS = 0x002        # Endpoint for writing to the device: 2  (decimal)
+    READ_EP_ADDRESS   = 0x081       # Endpoint for reading from the device: 129 (decimal)
+    WRITE_EP_ADDRESS  = 0x002       # Endpoint for writing to the device: 2  (decimal)
     PACKET_LENGTH = 8               # Maximum packet length is 8 bytes (possibly 5 for std X10 remotes)
     ACK = 0x0FF                     # Bit string received on CM19a send success = 11111111 (binary) = 255 (decimal)
 
     SEND_TIMEOUT = 1000             # 1000 ms = 1s
     RECEIVE_TIMEOUT = 100           # 100 ms
-    PROTOCOL_FILE = "CM19aProtocol.ini"
+    PROTOCOL_FILE = "./CM19aProtocol.ini"
 
-    def __init__(self, refresh=1, polling=False):
+    def __init__(self, refresh=1, loginstance=None, polling=False):
         # Initialise the object and create the device driver
         threading.Thread.__init__(self)     # initialise the thread for automatic monitoring
         self.refresh = refresh
@@ -85,18 +183,29 @@ class CM19aDevice(threading.Thread):
         self.receivequeuecount = 0          # Number of items in the receive queue
         self.protocol = {}                  # Dict containing the communications protocol for the CM19a
 
+        # Set up logging
+        if loginstance:
+            self.log = loginstance
+        else:
+            # No logger instance provided so create one
+            import logger
+            self.log = logger.start_logging("CM19a_X10_USB", "./CM19a.log")
+
         # Find the correct USB device
         self.USB_device = USBdevice(self.VENDOR_ID, self.PRODUCT_ID)
         # save the USB instance that points to the CM19a
         self.device = self.USB_device.device
         if not self.device:
             print >> sys.stderr, "The CM19a is probably not plugged in or is being controlled by another USB driver."
+            self.log.error('The CM19a is probably not plugged in or is being controlled by another USB driver.')
             return
 
         # Open the device for send/receive
         if not self._open_device():
             # Device was not opened successfully
             return
+
+        self.print_device_info()
 
         # Load the communications protocol
         self._load_protocol()
@@ -110,7 +219,8 @@ class CM19aDevice(threading.Thread):
         if self.polling:
             self.start()
 
-    def _open_device(self):
+
+    def _open_device(self) :
         """ Open the device, claim the interface, and create a device handle """
 
         if not self.device:
@@ -135,10 +245,13 @@ class CM19aDevice(threading.Thread):
             self.handle.setAltInterface(self.ALTERNATE_SETTING_ID)
 
             print "Cm19a opened and interface claimed."
+            self.log.info("Cm19a opened and interface claimed")
             self.initialised = True
         except usb.USBError, err:
             print >> sys.stderr, err
+            self.log.error(err)
             print >> sys.stderr, "Unable to open and claim the CM19a interface."
+            self.log.error("Unable to open and claim the CM19a interface.")
             self.initialised = False
             return False
 
@@ -155,6 +268,7 @@ class CM19aDevice(threading.Thread):
         for s in sequence:
             result = self._write_bytes(s)
             if not result:
+                self.log.error("Error initialising the CM19a for wireless remote controls")
                 print  >> sys.stderr, "Error initialising the CM19a for wireless remote controls"
 
 
@@ -205,6 +319,9 @@ class CM19aDevice(threading.Thread):
             else:
                 self.receivequeue.append(result)
                 self.receivequeuecount = self.receivequeuecount + 1
+                #print "Command %s received via the cm19a and added to the receive queue." % result
+                self.log.info("Command %s received via the cm19a and added to the receive queue." % result)
+
 
     def getReceiveQueue(self):
         """ 
@@ -237,10 +354,14 @@ class CM19aDevice(threading.Thread):
         if not self.initialised:
             return False
 
+        self.log.info("Sending %s%s %s" % (house_code.upper(), unit_number, function.upper()))
+        print "Sending %s%s %s" % (house_code.upper(), unit_number, function.upper())
+
         # Encode the command to the X10 protocol
         command_sequence = self._encode(house_code, unit_number, function)        # -> list
         if not command_sequence:
             # encoding error
+            self.log.error("Unable to send command; encoding error occurred.")
             return False
 
         # Pause automatic receiving while we send
@@ -253,6 +374,8 @@ class CM19aDevice(threading.Thread):
 
         # Write the command sequence to the device
         result = self._write_bytes(command_sequence)
+        self.log.info("Result %s%s %s: %r" % (house_code.upper(), unit_number, function.upper(), result))
+        print "Result %s%s %s: %r" % (house_code.upper(), unit_number, function.upper(), result)
 
         # Restart automatic receiving and return
         self.paused = False
@@ -269,11 +392,15 @@ class CM19aDevice(threading.Thread):
             chars_written = self.handle.interruptWrite(self.WRITE_EP_ADDRESS, bytesequence, self.SEND_TIMEOUT)
             returnval = True
         except Exception, err:
+            print >> sys.stderr, err
+            self.log.error(str(err))
             chars_written = 0
             returnval = False
 
         if chars_written != len(bytesequence):
             # Incorrect number of bytes written
+            print  >> sys.stderr, "Incorrect number of bytes written."
+            self.log.error("Incorrect number of bytes written.")
             returnval = False
 
         return returnval
@@ -287,6 +414,8 @@ class CM19aDevice(threading.Thread):
         if key in self.protocol:
             return self.protocol[key]
         else:
+            print >> sys.stderr, "Unable to encode the requested action: %s" %  key
+            self.log.error("Unable to encode the requested action: %s" %  key)
             return False
 
 
@@ -300,6 +429,7 @@ class CM19aDevice(threading.Thread):
 
         if not (self.protocol and self.protocol_remote):
             # the protocol has not been loaded
+            self.log.error("Cannot decode in inbound command since the protocol is not loaded")
             return ""
 
         return_value = None
@@ -351,6 +481,8 @@ class CM19aDevice(threading.Thread):
         # Loads the X10 protocol into a dict
 
         if not self.device:
+            print >> sys.stderr, "Cannot load X10 Protocol since the CM19a is not plugged in."
+            self.log.error("Cannot load X10 Protocol since the CM19a is not plugged in.")
             return
 
         self.protocol = {}  # empty dictionary
@@ -359,6 +491,8 @@ class CM19aDevice(threading.Thread):
         # Open the configuration file
         fname = self.PROTOCOL_FILE
         if not os.path.isfile(fname):
+            print >> sys.stderr, "**ERROR**", "Protocol file missing %s" % fname
+            self.log.error("**ERROR**", "Protocol file missing %s" % fname)
             self.initialised = False
             return None
         f = open(fname, "r")
@@ -422,7 +556,14 @@ class CM19aDevice(threading.Thread):
             self.handle.releaseInterface()
         except Exception, err:
             print >> sys.stderr, err
+            self.log.error(str(err))
         self.handle, self.device = None, None
+
+
+    def print_device_info(self):
+        self.USB_device.print_device_info()
+
+#End class
 
 
 class HTTPServer(BaseHTTPServer.HTTPServer):
@@ -435,14 +576,40 @@ class HTTPServer(BaseHTTPServer.HTTPServer):
         while self.alive:
             # Continue to respond to HTTP requests until self.alive is set to False
             self.handle_request()
+        print "HTTP server is shutting down due to a user request"
 
-class HTTPhandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
-    """ Performs X10 controls in the /api/ namespace, loads file for other
-        paths.
+
+class HTTPhandler(BaseHTTPServer.BaseHTTPRequestHandler):
     """
+        Processes HTTP requests
+        Subclasses the BaseHTTPServer and adds additional functionality
+
+        HTTP reponse codes
+            200 OK
+            400 Bad Request
+            500 Error
+    """
+
     server_version= "MyHandler/1.1"
 
     def do_GET(self):
+        #self.log_message("Command: %s Path: %s Headers: %r" % (self.command, self.path, self.headers.items()))
+        self.processRequest(None)
+
+
+    def do_POST(self):
+        # A form is posted via a HTML post
+        self.sendPage(400, "text/html", "HTML forms/web pages not yet implemnted")
+        return
+        #self.log_message("Command: %s Path: %s Headers: %r" % ( self.command, self.path, self.headers.items()))
+        #if self.headers.has_key('content-length'):
+        #    length= int(self.headers['content-length'])
+        #    self.dumpReq(self.rfile.read(length))
+        #else:
+        #    self.processRequest(None)
+
+
+    def processRequest(self, formInput=None):
         # Example client calls
         # http://192.168.1.3:8008/?house=A&unit=1&command=ON
         # http://192.168.1.3:8008/?house=A&unit=1&command=DIM
@@ -483,6 +650,61 @@ class HTTPhandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
                 response = cm19a.send(house, unit, command)     # True if the command was sent OK
             except:
                 response = False
+        elif command in ['getqueue', 'receive', 'getreceivequeue']:
+            response = cm19a.getReceiveQueue()
+            if len(response) > 0:
+                response = ','.join(response)
+            else:
+                response = "Receive queue is empty"
+        elif command in ['clearqueue',]:
+            # clear the queue
+            cm19a.paused = True
+            cm19a.receivequeue = []
+            cm19a.receivequeuecount = 0
+            cm19a.paused = False
+            response = "Receive queue emptied successfully"
+        elif command in ['quit', 'shutdown', 'exit']:
+            response = "Shutting down the server..."
+            # Do a fake call so that the server can terminate
+            global server
+            if server.alive:
+                server.alive = False
+                conn = httplib.HTTPConnection("%s:%s" % (SERVER_IP_ADDRESS, SERVER_PORT))
+                conn.request("GET", '?command=nothing')
+        elif command in ['getversion', 'version']:
+            response = VERSION
+        elif command in ['getlogs',  'getlog']:
+            # Returns the Logs (text only)
+            if not os.path.isfile(LOGFILE):
+                log.error("%s log file missing %s" % LOGFILE)
+                response = ''
+            else:
+                respcode = 200
+                response = "CM19a Device Driver Log\n"
+                f = open(LOGFILE, "r")
+                for aline in f.readlines():
+                    response += aline
+                f.close()
+        elif command in ['getformattedlog',]:
+            # Returns the Logs with HTML formatting for display purposes
+            if not os.path.isfile(LOGFILE):
+                log.error("%s log file missing %s" % LOGFILE)
+                response = ''
+            else:
+                respcode = 200
+                response = "<html><body><p style='font-family:Arial;font-size:14pt;font-weight:bold;color:navy;line-height:100%%'>CM19a Device Driver Log</p>"
+                f = open(LOGFILE, "r")
+                for aline in f.readlines():
+                    if aline.lower().find('critical') >= 0:
+                        response +=  "<p style='font-family:Arial;font-size:10pt;font-weight:bold;color:white;background-color:red;line-height:100%%'>%s</p>" % aline
+                    elif aline.lower().find('error') >= 0:
+                        response +=  "<p style='font-family:Arial;font-size:10pt; font-weight:normal;color:white;background-color:red;line-height:100%%'>%s</p>" % aline
+                    elif aline.lower().find('warning') >= 0:
+                        response +=  "<p style='font-family:Arial;font-size:10pt; font-weight:bold;color:olive;background-color:yellow;line-height:100%%'>%s</p>" % aline
+                    else:
+                        response +=  "<p style='font-family:Arial;font-size:10pt; font-weight:normal;color:gray;background-color:white;line-height:30%%'>%s</p>" % aline
+                f.close()
+                response += "</body></html>"
         else:
             # error no command request
             respcode = 400
@@ -493,28 +715,129 @@ class HTTPhandler(SimpleHTTPServer.SimpleHTTPRequestHandler):
                 respcode = 200
                 response = "ACK"
             else:
-                respcode = 500
+                reposcode = 500
                 response = "NAK"
 
         self.sendPage(respcode, "text/html", str(response))
 
-    def sendPage(self, code, cttype, body):
+    def sendPage(self, code,  type, body):
         body+= "\n\r"
         self.send_response(code)
-        self.send_header("Content-type", cttype)
+        self.send_header("Content-type", type)
         self.send_header("Content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+# End Class
 
+def startLogging(progname="CM19a_X10_USB", logfile='./cm19a.log'):
+    return logger.start_logging(progname, logfile)
+
+def processcommandline():
+    """Process the command line
+        Command line usage:
+           cm19aDriver.py  house&unitcode ON/OFF
+           e.g. cm19aDriver.py A 1 ON     # Turns on device A1, returns 1 if OK, 0 if not
+           You can only send a command via the command line, you cannot read/receive a wireless command form anX10 remote"
+        Returns 0 is OK, 1 if failure
+    """
+
+    # Get the command line arguments
+    try:
+        house = sys.argv[1]     # First command line argument after the program name
+        unit = sys.argv[2]      # 2nd argument
+        cmd = sys.argv[3]       # 3rd argument
+        print "Doing %s%s %s..." % (house, unit, cmd)
+        result = cm19a.send(house, unit, cmd)     # True if the command was sent OK
+        if result:
+            print "Result: %r" % result
+            returnval = 0
+        else:
+            print  >> sys.stderr, "Command failed: %s%s %s" % (house, unit, cmd)
+            returnval = 1
+    except:
+        print  >> sys.stderr, "Invalid command line"
+        returnval = 1
+
+    return returnval
+
+
+#Main
 if __name__ == '__main__':
-    cm19a = CM19aDevice(REFRESH, polling = True)       # Initialise device. Note: auto polling/receviing in a thread is turned ON
-    if cm19a.initialised:
-        server = HTTPServer((SERVER_IP_ADDRESS, SERVER_PORT,), HTTPhandler)
-        server.serve_forever()
-        # Finish and tidy up
-        server = None
-        cm19a.finish()
-        sys.exit(0)
+
+    # Configure logging
+    log = startLogging(LOGFILE)
+
+    if MODE.lower() == 'command line':
+        # Process the command line (send commands only)
+        # Exits with an error level of 0 if successful
+        if len(sys.argv) <= 1 :
+            # no command line arguments given
+            print "Command line usage:"
+            print "   cm19a_X10_USB.py  house&unitcode ON/OFF"
+            print "   e.g. cm19a_X10_USB.py A 1 ON     # Turns on device A1, returns 1 if OK, 0 if not"
+            print "   You can only send a command via the command line, you cannot read/receive a wireless command form anX10 remote"
+            sys.exit(2)
+        else:
+            print "\nInitialising..."
+            log.info('Initialising...')
+            cm19a = CM19aDevice(REFRESH, log, polling = False)       # Initialise device. Note: auto receiving in a thread is turned off for this example
+            if cm19a.initialised:
+                result = processcommandline()
+                cm19a.finish()
+                sys.exit(result)
+            else:
+                print "Error initialising the CM19a...exiting..."
+                log.error("Error initialising the CM19a...exiting...")
+                cm19a.finish()
+                sys.exit(1)
+
+        #***** Example command line (Linux/Bash) *****
+        # Note: $? is the exit status/error level. Zero means success
+        #    sudo ./cm19aDriver.py A 1 ON
+        #    echo "Result: $?"
+
+    elif MODE.lower() in ['http server', 'web server']:
+        # Accept commands via http (eg a Web Browser)
+        print "\nInitialising..."
+        log.info('Initialising...')
+        cm19a = CM19aDevice(REFRESH, log, polling = True)       # Initialise device. Note: auto polling/receviing in a thread is turned ON
+        if cm19a.initialised:
+            log.info("Configuring the HTTP server on %s:%s" % (SERVER_IP_ADDRESS, SERVER_PORT))
+            print "Configuring the HTTP server on %s:%s" % (SERVER_IP_ADDRESS, SERVER_PORT)
+            server = HTTPServer((SERVER_IP_ADDRESS, SERVER_PORT,), HTTPhandler)
+            log.info("Starting the HTTP server...")
+            print "Starting the HTTP server..."
+            server.serve_forever()
+            # Finish and tidy up
+            server = None
+            log.info("All done")
+            cm19a.finish()
+            sys.exit(0)
+        else:
+            print "Error initialising the CM19a...exiting..."
+            log.error("Error initialising the CM19a...exiting...")
+            cm19a.finish()
+            sys.exit(1)
+
+        # Example client calls from a web browser
+        #   http://192.168.1.3:8008/?house=A&unit=1&command=ON
+        #   http://192.168.1.3:8008?command=getqueue              Returns a comma separated list of the commands received since the last getqueue call
+        #   http://192.168.1.3:8008?command=clearqueue
+        #   http://192.168.1.3:8008?command=getlog
+        #   http://192.168.1.3:8008?command=getformattedlog
+        #   http://192.168.1.3:8008?command=getversion
+        #   http://192.168.1.3:8008?command=quit                  Gracefully shuts down the driver
+
+        # Example command line using the cURL (a command line URL client that send the command via http)
+        #   sudo ./cm19aDriver.py (ensure MODE = 'HTTP SERVER')
+        #   result=`curl --silent http://192.168.1.3:8008/?house=A\&unit=1\&command=ON`     NOTE THAT THE AMPERSAND NEEDS TO BE ESCAPED WITH A BACK SLASH
+        #   echo $result
+        #   result=`curl --silent http://192.168.1.3:8008/?command=getqueue`                NOTE the use of the ` character - this is not a single quote
+        #   echo $result
+        #   curl --silent http://192.168.1.3:8008/?command=quit
     else:
-        cm19a.finish()
-        sys.exit(1)
+        print "Please set the MODE of operation."
+
+
+# End of module
+
