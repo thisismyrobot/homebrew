@@ -1,0 +1,92 @@
+<html>
+    <head>
+        <script src="js/jquery-1.9.1.min.js"></script>
+        <script src="js/highcharts.js"></script>
+        <script>
+            function chart(name, goal, actual, fridge)
+            {
+                $('#container').highcharts({
+                    title: {
+                        text: 'Beer monitor:' + name
+                    },
+                    xAxis: {
+                        name: 'Time',
+                        type: 'datetime',
+                        dateTimeLabelFormats: {
+                            day: '%d %b'
+                        },
+                        tickInterval: 24 * 3600 * 1000
+                    },
+                    series: [{
+                        data: goal,
+                        step: 'left',
+                        name: 'Goal temperature',
+                        dataLabels: {
+                            enabled: true,
+                            formatter: function() {
+                                return this.point.label;
+                            }
+                        },
+                    }, {
+                        data: actual,
+                        name: 'Actual temperature'
+                    }, {
+                        data: fridge,
+                        step: true,
+                        name: 'Fridge'
+                    }]
+                });
+            }
+
+            $(function () {
+                jQuery.ajaxSetup({async:false});
+
+                var start = 0;
+                var goal = [];
+                var actual = [];
+                var fridge = [];
+
+                $.get('data/temperatures.out', function(data) {
+                    $.each(data.split('\n'), function(_, line) {
+                        var date = new Date(parseInt(line.split(',')[0]));
+                        var temperature = parseFloat(line.split(',')[1]);
+                        actual.push({x: date, y: temperature});
+                    });
+                });
+
+                $.get('data/fridge.out', function(data) {
+                    $.each(data.split('\n'), function(_, line) {
+                        var date = new Date(parseInt(line.split(',')[0]));
+                        var state = parseInt(line.split(',')[1]);
+                        fridge.push({x: date, y: state});
+                    });
+                });
+
+                $.get('data/profilestart.out', function(data) {
+                    start = parseInt(data);
+                });
+
+                var name = "";
+                $.get('data/profile.txt', function(data) {
+                    $.each(data.split('\n'), function(i, line) {
+                        if (i == 0) {
+                            name = line;
+                        }
+                        else {
+                            var offset = parseInt(line.split(',')[0]);
+                            var temperature = parseInt(line.split(',')[1]);
+                            var comment = line.split(',')[2];
+                            var date = new Date(start + (offset * 60 * 60 * 1000));
+                            goal.push({x: date, y: temperature, label: comment});
+                        }
+                    });
+                });
+
+                chart(name, goal, actual, fridge);
+            });
+        </script>
+    </head>
+    <body>
+        <div id="container" style="width:100%; height:400px;"></div>
+    </body>    
+</html>
